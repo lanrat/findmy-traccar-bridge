@@ -12,7 +12,7 @@ of your custom tracking beacons from Apple's FindMy network.
 ## Requirements
 
 - Docker or Python 3.12
-- Some OpenHaystack beacons generating data, or [decrypted plist files](https://github.com/malmeloo/FindMy.py/issues/31) for real Airtags
+- Some OpenHaystack beacons generating data, [decrypted plist files](https://github.com/malmeloo/FindMy.py/issues/31) for real AirTags, or JSON key files
   - e.g. an [esp32](https://github.com/dchristl/macless-haystack/blob/main/firmware/ESP32/README.md) or [NRF51](https://github.com/dchristl/macless-haystack/blob/main/firmware/nrf5x/README.md)
   - I recommend following the instructions `2. Hardware setup` from [macless-haystack](https://github.com/dchristl/macless-haystack?tab=readme-ov-file#setup). This is also where you will generate the private key for later.
 - Access to an Apple account with 2FA enabled
@@ -34,37 +34,57 @@ services:
       - ./:/bridge/data
       # Optional: Mount a directory with plist files for AirTags
       - /path/to/your/plists:/bridge/plists
+      # Optional: Mount a directory with JSON key files for AirTags
+      - /path/to/your/json_keys:/bridge/json_keys
     environment:
       # For OpenHaystack beacons, specify their private keys
       BRIDGE_PRIVATE_KEYS: "<key1>,<key2>,..."
       BRIDGE_TRACCAR_SERVER: "<your traccar base url>:5055"
-      BRIDGE_ANISETTE_SERVER: "http://anisette:6969"
-  anisette:
-    image: dadoum/anisette-v3-server
-    volumes:
-      - anisette_data:/home/Alcoholic/.config/anisette-v3/lib/
-volumes:
-  anisette_data:
+      # Optional: Use a remote anisette server instead of built-in
+      # BRIDGE_ANISETTE_SERVER: "http://anisette:6969"
 ```
+
+> [!NOTE]
+> The bridge now uses a **built-in anisette provider** by default, so an external anisette server is no longer required.
+> If you prefer to use a remote anisette server, you can still set `BRIDGE_ANISETTE_SERVER`.
+
+<details>
+  <summary>With external anisette server (optional)</summary>
+
+  ```yml
+  services:
+    bridge:
+      build: https://github.com/jannisko/findmy-traccar-bridge.git
+      volumes:
+        - ./:/bridge/data
+        - /path/to/your/plists:/bridge/plists
+        - /path/to/your/json_keys:/bridge/json_keys
+      environment:
+        BRIDGE_PRIVATE_KEYS: "<key1>,<key2>,..."
+        BRIDGE_TRACCAR_SERVER: "<your traccar base url>:5055"
+        BRIDGE_ANISETTE_SERVER: "http://anisette:6969"
+    anisette:
+      image: dadoum/anisette-v3-server
+      volumes:
+        - anisette_data:/home/Alcoholic/.config/anisette-v3/lib/
+  volumes:
+    anisette_data:
+  ```
+</details>
 
 <details>
   <summary>via docker</summary>
 
   ```shell
   docker build -t findmy-traccar-bridge https://github.com/jannisko/findmy-traccar-bridge.git
-  docker network create bridge_net
-  docker run -d --name anisette \
-  -v ./anisette:/home/Alcoholic/.config/anisette-v3/lib/ \
-  --network bridge_net \
-  dadoum/anisette-v3-server
   docker run -d --name bridge \
   -v ./:/data \
   # Optional: Mount directory with plist files for AirTags
   -v /path/to/your/plists:/bridge/plists \
-  --network bridge_net \
+  # Optional: Mount directory with JSON key files for AirTags
+  -v /path/to/your/json_keys:/bridge/json_keys \
   -e BRIDGE_PRIVATE_KEYS="<key1>,<key2>,..." \
   -e BRIDGE_TRACCAR_SERVER="<your traccar base url>" \
-  -e BRIDGE_ANISETTE_SERVER="anisette:6969" \
   findmy-traccar-bridge
   ```
 </details>
@@ -74,12 +94,13 @@ volumes:
 
   ```shell
   # Set up environment variables
-  # you should probably start your own anisette server for this
   export BRIDGE_PRIVATE_KEYS="<key1>,<key2>,..." BRIDGE_TRACCAR_SERVER="<your traccar base url>"
   # If you want to use AirTags through plist files, they'll be detected automatically in /bridge/plists
   # Optionally you can override the plist directory:
   # export BRIDGE_PLIST_DIR="/path/to/your/plists"
-  
+  # For JSON key files:
+  # export BRIDGE_JSON_DIR="/path/to/your/json_keys"
+
   # Run the bridge
   uvx --from=git+https://github.com/jannisko/findmy-traccar-bridge findmy-traccar-bridge
   ```
@@ -113,15 +134,29 @@ docker compose exec bridge .venv/bin/findmy-traccar-bridge-init
 
 The script can be configured via the following environment variables:
 
-- `BRIDGE_PRIVATE_KEYS` - comma separated string of base64 encoded private keys of your OpenHaystack beacons (e.g. can be generated via instructions from [macless-haystack](https://github.com/dchristl/macless-haystack?tab=readme-ov-file#hardware-setup))
-- `BRIDGE_PLIST_DIR` - (optional) override the default directory path for [decrypted plist files](https://github.com/malmeloo/FindMy.py/issues/31). By default, the app will look for .plist files in `/bridge/plists`. Only set this if you need to use a different location.
-- `BRIDGE_TRACCAR_SERVER` - required - url to your traccar server
-- `BRIDGE_ANISETTE_SERVER` - optional (default: `https://ani.sidestore.io`) - url to the anisette server used for login
-- `BRIDGE_POLL_INTERVAL` - optional (default: 3600 (60 minutes)) - time to wait between querying the apple API. Too frequent polling might get your account banned.
-- `BRIDGE_LOGGING_LEVEL` - optional (default: INFO)
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `BRIDGE_TRACCAR_SERVER` | Yes | - | URL to your Traccar server (e.g., `http://traccar:5055`) |
+| `BRIDGE_PRIVATE_KEYS` | No | - | Comma-separated base64 encoded private keys for OpenHaystack beacons |
+| `BRIDGE_PLIST_DIR` | No | `/bridge/plists` | Directory path for [decrypted plist files](https://github.com/malmeloo/FindMy.py/issues/31) |
+| `BRIDGE_JSON_DIR` | No | `/bridge/json_keys` | Directory path for JSON key files (see [FindMy.py examples](https://github.com/malmeloo/FindMy.py/tree/main/examples)) |
+| `BRIDGE_ANISETTE_SERVER` | No | *(built-in)* | URL to a remote anisette server. If not set, uses the built-in local anisette provider (recommended) |
+| `BRIDGE_POLL_INTERVAL` | No | `3600` | Seconds between Apple API queries. Too frequent polling may get your account banned |
+| `BRIDGE_LOGGING_LEVEL` | No | `INFO` | Logging verbosity level |
+
+### Device Configuration
+
+You need at least one of the following configured:
+1. **OpenHaystack beacons**: Set `BRIDGE_PRIVATE_KEYS` with comma-separated base64 keys
+2. **AirTags via plist**: Mount `.plist` files to `/bridge/plists` (or set `BRIDGE_PLIST_DIR`)
+3. **AirTags via JSON**: Mount `.json` key files to `/bridge/json_keys` (or set `BRIDGE_JSON_DIR`)
+
+### Battery Level
+
+The bridge reports battery level to Traccar as the `batt` attribute (percentage: 100=Full, 75=Medium, 50=Low, 25=Very Low).
 
 > [!TIP]
-> Self-hosting Anisette (and setting `BRIDGE_ANISETTE_SERVER`) is optional, but using the default value may cause issues with authentication. If you are getting repeated errors like `LoginState.REQUIRE_2FA`, this might be the culprit.
+> Self-hosting Anisette (and setting `BRIDGE_ANISETTE_SERVER`) is optional. The built-in anisette provider is now the default and recommended approach. If you experience authentication issues, you can try using a self-hosted anisette server instead.
 
 ## Example
 

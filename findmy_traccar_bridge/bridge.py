@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import TypedDict
 
 import requests
-from findmy import KeyPair
-from findmy import FindMyAccessory
+from findmy import KeyPair, FindMyAccessory
 from findmy.reports import (
     AppleAccount,
     LoginState,
+    LocalAnisetteProvider,
     RemoteAnisetteProvider,
     SmsSecondFactorMethod,
     TrustedDeviceSecondFactorMethod,
@@ -22,8 +22,6 @@ from loguru import logger
 logger.remove()
 logger.add(sys.stderr, level=os.environ.get("BRIDGE_LOGGING_LEVEL", "INFO"))
 
-ANISETTE_SERVER = os.environ.get("BRIDGE_ANISETTE_SERVER", "https://ani.sidestore.io")
-
 POLLING_INTERVAL = int(os.environ.get("BRIDGE_POLL_INTERVAL", 60 * 60))
 
 
@@ -31,7 +29,29 @@ data_folder = Path("./data/")
 data_folder.mkdir(exist_ok=True)
 persistent_data_store = data_folder / "persistent_data.json"
 acc_store = data_folder / "account.json"
-acc = AppleAccount(RemoteAnisetteProvider(ANISETTE_SERVER))
+anisette_libs_store = data_folder / "ani_libs.bin"
+
+
+# Battery level mapping from status byte (bits 6-7)
+BATTERY_LEVELS = {
+    0b00: 100,  # Full
+    0b01: 75,   # Medium
+    0b10: 50,   # Low
+    0b11: 25,   # Very Low
+}
+
+BATTERY_NAMES = {
+    0b00: "Full",
+    0b01: "Medium",
+    0b10: "Low",
+    0b11: "Very Low",
+}
+
+
+def get_battery_level(status: int) -> tuple[int, str]:
+    """Extract battery level from location report status byte."""
+    battery_id = (status >> 6) & 0b11
+    return BATTERY_LEVELS.get(battery_id, 0), BATTERY_NAMES.get(battery_id, "Unknown")
 
 
 class Location(TypedDict):
@@ -39,6 +59,8 @@ class Location(TypedDict):
     timestamp: int
     lat: float
     lon: float
+    batt: int  # Battery percentage (0-100)
+    accuracy: int  # Horizontal accuracy in meters
 
 
 class PersistentData(TypedDict):
@@ -93,7 +115,6 @@ def load_airtags_from_directory(directory_path: str | None) -> list[FindMyAccess
         return []
         
     plist_files = list(dir_path.glob("*.plist"))
-    
     for plist_path in plist_files:
         try:
             with plist_path.open("rb") as f:
@@ -104,6 +125,74 @@ def load_airtags_from_directory(directory_path: str | None) -> list[FindMyAccess
     return airtags
 
 
+def load_airtags_from_json_directory(directory_path: str | None) -> tuple[list[FindMyAccessory], dict[FindMyAccessory, Path]]:
+    """
+    Load FindMyAccessory objects from .json key files in the specified directory.
+
+    Args:
+        directory_path: Path to the directory containing .json key files
+
+    Returns:
+        Tuple of (list of accessories, dict mapping accessory to its file path)
+    """
+    if not directory_path:
+        return [], {}
+
+    airtags = []
+    airtag_paths: dict[FindMyAccessory, Path] = {}
+    dir_path = Path(directory_path)
+
+    if not dir_path.exists():
+        # Only log as error if it's not the default path
+        if directory_path != "/bridge/json_keys":
+            logger.error("JSON keys directory does not exist: {}", directory_path)
+        return [], {}
+
+    if not dir_path.is_dir():
+        logger.error("JSON keys path is not a directory: {}", directory_path)
+        return [], {}
+
+    for json_path in dir_path.glob("*.json"):
+        try:
+            airtag = FindMyAccessory.from_json(json_path)
+            airtags.append(airtag)
+            airtag_paths[airtag] = json_path
+            logger.debug("Loaded JSON key file: {}", json_path.name)
+        except Exception as e:
+            logger.error("Failed to load JSON key file {}: {}", json_path, str(e))
+
+    return airtags, airtag_paths
+
+
+def create_account() -> AppleAccount:
+    """
+    Create an AppleAccount with appropriate anisette provider.
+    Uses LocalAnisetteProvider if BRIDGE_ANISETTE_SERVER is not set (recommended).
+    """
+    anisette_server = os.environ.get("BRIDGE_ANISETTE_SERVER")
+
+    if anisette_server:
+        logger.info("Using remote anisette server: {}", anisette_server)
+        anisette = RemoteAnisetteProvider(anisette_server)
+    else:
+        logger.info("Using built-in local anisette provider")
+        anisette = LocalAnisetteProvider(libs_path=str(anisette_libs_store))
+
+    return AppleAccount(anisette)
+
+
+def load_account() -> AppleAccount:
+    """Load account from JSON store."""
+    anisette_server = os.environ.get("BRIDGE_ANISETTE_SERVER")
+    libs_path = None if anisette_server else str(anisette_libs_store)
+    try:
+        return AppleAccount.from_json(acc_store, anisette_libs_path=libs_path)
+    except (ValueError, KeyError, json.JSONDecodeError) as e:
+        logger.error("Failed to load account (may be old format): {}", e)
+        logger.error("Please delete {} and re-run findmy-traccar-bridge-init", acc_store)
+        raise
+
+
 def bridge() -> None:
     """
     Main loop fetching location data from the Apple API and forwarding it to a Traccar server.
@@ -112,21 +201,25 @@ def bridge() -> None:
     """
 
     private_keys = [k for k in (os.environ.get("BRIDGE_PRIVATE_KEYS") or "").split(",") if k]
-    
-    # Default plist directory location
-    default_plist_dir = "/bridge/plists"
-    
-    # Custom plist directory can override the default
-    plist_dir = os.environ.get("BRIDGE_PLIST_DIR", default_plist_dir)
-    
+
+    # Directory locations
+    plist_dir = os.environ.get("BRIDGE_PLIST_DIR", "/bridge/plists")
+    json_dir = os.environ.get("BRIDGE_JSON_DIR", "/bridge/json_keys")
+
     haystack_keys = [KeyPair.from_b64(key) for key in private_keys]
-    real_airtags = load_airtags_from_directory(plist_dir)
-    
+    plist_airtags = load_airtags_from_directory(plist_dir)
+    json_airtags, json_airtag_paths = load_airtags_from_json_directory(json_dir)
+    real_airtags = plist_airtags + json_airtags
+
     if not private_keys and not real_airtags:
         raise ValueError(
-            "No tracking devices configured. Either set BRIDGE_PRIVATE_KEYS environment variable "
-            "or mount a directory with .plist files to /bridge/plists"
+            "No tracking devices configured. Options:\n"
+            "  1. Set BRIDGE_PRIVATE_KEYS env var (Haystack beacons)\n"
+            "  2. Mount .plist files to /bridge/plists (or set BRIDGE_PLIST_DIR)\n"
+            "  3. Mount .json key files to /bridge/json_keys (or set BRIDGE_JSON_DIR)"
         )
+
+    logger.info("Loaded {} plist AirTags, {} JSON AirTags", len(plist_airtags), len(json_airtags))
 
     TRACCAR_SERVER = os.environ["BRIDGE_TRACCAR_SERVER"]
 
@@ -141,18 +234,12 @@ def bridge() -> None:
         while not acc_store.is_file():
             time.sleep(1)
 
-    with acc_store.open() as f:
-        acc.restore(json.load(f))
-
-    logger.info(
-        "Successfully loaded Apple account token with uid {}...", acc._asyncacc._uid[:4]
-    )
-
-    haystack_keys = [KeyPair.from_b64(key) for key in private_keys]
+    acc = load_account()
+    logger.info("Successfully loaded Apple account")
 
     logger.info("Configured {} device{}:",
                 len(haystack_keys) + len(real_airtags),
-                "" if len(real_airtags) == 1 else "s")
+                "" if len(haystack_keys) + len(real_airtags) == 1 else "s")
     for key in haystack_keys:
         logger.info(
             "   Haystack device\t| Private key: {}[...]\t\t|\tTraccar ID {}",
@@ -160,10 +247,14 @@ def bridge() -> None:
             int.from_bytes(key.hashed_adv_key_bytes) % 1_000_000
         )
     for airtag in real_airtags:
+        identifier = airtag.identifier or airtag.name or "unknown"
+        display_name = airtag.name or airtag.identifier or "unknown"
+        traccar_id = int.from_bytes(identifier.encode()[:8], 'big') % 1_000_000
         logger.info(
-            "   FindMy device\t\t| plist identifier: {}[...]\t|\tTraccar ID {}",
-            airtag.identifier[:16],
-            int.from_bytes(airtag.identifier.encode()) % 1_000_000
+            "   FindMy device\t\t| {}: {}[...]\t|\tTraccar ID {}",
+            "name" if airtag.name else "identifier",
+            display_name[:16],
+            traccar_id
         )
 
     persistent_data: PersistentData = json.loads(persistent_data_store.read_text())
@@ -211,62 +302,68 @@ def bridge() -> None:
                 for location in persistent_data["pending_locations"]
             }
 
-            result = acc.fetch_last_reports(haystack_keys)
-            for airtag in real_airtags:
-                result[airtag.identifier] = acc.fetch_last_reports(airtag)
+            # Fetch location history using new API
+            all_devices = haystack_keys + real_airtags
+            reports_dict = acc.fetch_location_history(all_devices) if all_devices else {}
 
             persistent_data["last_apple_api_call"] = int(
                 datetime.datetime.now().timestamp()
             )
             commit(persistent_data)
 
-            for key, reports in result.items():
-                # Traccar expects unique int ids for each device. How we get it depends on the accessory type.
-                if isinstance(key, str):
-                    # The result set belongs to a "real" FindMy accessory, so we will get many Keypairs
-                    # back due to key rotation. Let's identify using the exported `identifier`
-                    traccar_id = int.from_bytes(key.encode()) % 1_000_000
-                    shorthand = key
+            for device, reports in reports_dict.items():
+                if not reports:
+                    continue
+
+                # Determine Traccar ID based on device type
+                if isinstance(device, FindMyAccessory):
+                    identifier = device.identifier or device.name or str(id(device))
+                    traccar_id = int.from_bytes(identifier.encode()[:8], 'big') % 1_000_000
+                    shorthand = (device.name or device.identifier or "accessory")[:16]
                 else:
-                    # The result set belongs to a Haystack accessory, so we the keypair is stable. We
-                    # will use that as an identifier.
-                    traccar_id = int.from_bytes(key.hashed_adv_key_bytes) % 1_000_000
-                    shorthand = key.hashed_adv_key_b64[:8]
+                    # Haystack device - use hashed key
+                    traccar_id = int.from_bytes(device.hashed_adv_key_bytes) % 1_000_000
+                    shorthand = device.hashed_adv_key_b64[:8]
 
                 logger.info(
-                    "Received {} locations from device:{} ({}...) from Apple",
+                    "Received {} locations from device:{} ({})",
                     len(reports),
                     traccar_id,
                     shorthand,
                 )
 
-                transformed_reports = [
-                    Location(
+                for report in reports:
+                    # Extract battery level
+                    battery_pct, battery_name = get_battery_level(report.status)
+
+                    new_location = Location(
                         id=traccar_id,
                         lat=report.latitude,
                         lon=report.longitude,
                         timestamp=int(report.timestamp.timestamp()),
+                        batt=battery_pct,
+                        accuracy=report.horizontal_accuracy,
                     )
-                    for report in reports
-                ]
 
-                # queue up new locations received from API without duplicating any
-                persistent_data["pending_locations"].extend(
-                    deduplicated_locations := [
-                        location
-                        for location in transformed_reports
-                        if (location["id"], location["timestamp"])
-                        not in already_uploaded
-                        and (location["id"], location["timestamp"])
-                        not in already_pending
-                    ]
-                )
-                logger.info(
-                    "Queued up {} locations from device:{} ({}...) for upload (deduplicated)",
-                    len(deduplicated_locations),
+                    loc_key = (new_location["id"], new_location["timestamp"])
+                    if loc_key not in already_uploaded and loc_key not in already_pending:
+                        persistent_data["pending_locations"].append(new_location)
+
+                logger.debug(
+                    "Queued locations from device:{} ({}) for upload",
                     traccar_id,
                     shorthand,
                 )
+
+            # Save JSON accessory state (alignment data)
+            for airtag, path in json_airtag_paths.items():
+                try:
+                    airtag.to_json(path)
+                except Exception as e:
+                    logger.debug("Could not save accessory state to {}: {}", path, e)
+
+            # Save account state (may include refreshed tokens)
+            acc.to_json(acc_store)
 
             logger.info(
                 "Next Apple API polling in {} seconds ({} UTC)",
@@ -326,6 +423,14 @@ def bridge() -> None:
 
             persistent_data["pending_locations"] = failed_upload_locations
 
+            # Prune old uploaded_locations to prevent unbounded growth
+            # Keep only locations newer than 2x polling interval for deduplication
+            cutoff = int(datetime.datetime.now().timestamp()) - (POLLING_INTERVAL * 2)
+            persistent_data["uploaded_locations"] = [
+                loc for loc in persistent_data["uploaded_locations"]
+                if loc["timestamp"] > cutoff
+            ]
+
             last_traccar_push_timestamp = datetime.datetime.now().timestamp()
 
             commit(persistent_data)
@@ -337,6 +442,8 @@ def init() -> None:
 
     Callable via the binary `.venv/bin/findmy-traccar-bridge-init`
     """
+    acc = create_account()
+
     email = input("email?  > ")
     password = getpass.getpass("passwd? > ")
 
@@ -359,5 +466,5 @@ def init() -> None:
 
         method.submit(code)
 
-    with acc_store.open("w+") as f:
-        json.dump(acc.export(), f)
+    # Use new persistence API
+    acc.to_json(acc_store)
