@@ -33,9 +33,58 @@ TRACCAR_API_PASS = os.environ.get("BRIDGE_TRACCAR_PASS", "")
 
 data_folder = Path("./data/")
 data_folder.mkdir(exist_ok=True)
+accounts_folder = data_folder / "accounts"
+accounts_folder.mkdir(exist_ok=True)
 persistent_data_store = data_folder / "persistent_data.json"
-acc_store = data_folder / "account.json"
-anisette_libs_store = data_folder / "ani_libs.bin"
+
+# Legacy paths for backwards compatibility / migration
+legacy_acc_store = data_folder / "account.json"
+legacy_anisette_store = data_folder / "ani_libs.bin"
+
+
+def get_account_folder(account_id: int) -> Path:
+    """Get the folder path for a specific account."""
+    folder = accounts_folder / str(account_id)
+    folder.mkdir(exist_ok=True)
+    return folder
+
+
+def get_account_store(account_id: int) -> Path:
+    """Get the account.json path for a specific account."""
+    return get_account_folder(account_id) / "account.json"
+
+
+def get_anisette_store(account_id: int) -> Path:
+    """Get the anisette libs path for a specific account."""
+    return get_account_folder(account_id) / "ani_libs.bin"
+
+
+def migrate_legacy_account() -> None:
+    """Migrate legacy single-account format to new multi-account structure."""
+    if legacy_acc_store.is_file() and not get_account_store(0).is_file():
+        logger.info("Migrating legacy account to multi-account structure...")
+        account_0_folder = get_account_folder(0)
+
+        # Move account.json
+        legacy_acc_store.rename(account_0_folder / "account.json")
+        logger.info("Migrated account.json to accounts/0/")
+
+        # Move anisette libs if they exist
+        if legacy_anisette_store.is_file():
+            legacy_anisette_store.rename(account_0_folder / "ani_libs.bin")
+            logger.info("Migrated ani_libs.bin to accounts/0/")
+
+
+def discover_accounts() -> list[int]:
+    """Discover all initialized accounts by scanning the accounts directory."""
+    account_ids = []
+    for item in accounts_folder.iterdir():
+        if item.is_dir() and (item / "account.json").is_file():
+            try:
+                account_ids.append(int(item.name))
+            except ValueError:
+                continue
+    return sorted(account_ids)
 
 
 # Battery level mapping from status byte (bits 6-7)
@@ -148,20 +197,32 @@ class PersistentData(TypedDict):
     pending_locations: list[Location]
     # recently uploaded locations used for deduplication
     uploaded_locations: list[Location]
-    # unix timestamp
-    last_apple_api_call: int
+    # per-account last poll timestamps: {"0": 123456, "1": 123457}
+    account_last_poll: dict[str, int]
 
 
-if not persistent_data_store.is_file():
-    persistent_data_store.write_text(
-        json.dumps(
-            PersistentData(
-                pending_locations=[],
-                uploaded_locations=[],
-                last_apple_api_call=0,
+def init_persistent_data() -> None:
+    """Initialize persistent data store if it doesn't exist."""
+    if not persistent_data_store.is_file():
+        persistent_data_store.write_text(
+            json.dumps(
+                PersistentData(
+                    pending_locations=[],
+                    uploaded_locations=[],
+                    account_last_poll={},
+                )
             )
         )
-    )
+    else:
+        # Migrate old format if needed (add account_last_poll if missing)
+        data = json.loads(persistent_data_store.read_text())
+        if "account_last_poll" not in data:
+            # Migrate from old single-account format
+            data["account_last_poll"] = {}
+            if "last_apple_api_call" in data:
+                # Move old timestamp to account 0
+                data["account_last_poll"]["0"] = data.pop("last_apple_api_call")
+            persistent_data_store.write_text(json.dumps(data))
 
 
 def commit(persistent_data: PersistentData) -> None:
@@ -171,29 +232,29 @@ def commit(persistent_data: PersistentData) -> None:
 def load_airtags_from_directory(directory_path: str | None) -> list[FindMyAccessory]:
     """
     Load all FindMyAccessory objects from .plist files in the specified directory.
-    
+
     Args:
         directory_path: Path to the directory containing .plist files
-        
+
     Returns:
         List of loaded FindMyAccessory objects
     """
     if not directory_path:
         return []
-        
+
     airtags = []
     dir_path = Path(directory_path)
-    
+
     if not dir_path.exists():
         # Only log as error if it's not the default path
         if directory_path != "/bridge/plists":
             logger.error("Plist directory does not exist: {}", directory_path)
         return []
-    
+
     if not dir_path.is_dir():
         logger.error("Plist path exists but is not a directory: {}", directory_path)
         return []
-        
+
     plist_files = list(dir_path.glob("*.plist"))
     for plist_path in plist_files:
         try:
@@ -201,7 +262,7 @@ def load_airtags_from_directory(directory_path: str | None) -> list[FindMyAccess
                 airtags.append(FindMyAccessory.from_plist(f))
         except Exception as e:
             logger.error("Failed to load plist file {}: {}", plist_path, str(e))
-            
+
     return airtags
 
 
@@ -244,32 +305,36 @@ def load_airtags_from_json_directory(directory_path: str | None) -> tuple[list[F
     return airtags, airtag_paths
 
 
-def create_account() -> AppleAccount:
+def create_account(account_id: int) -> AppleAccount:
     """
     Create an AppleAccount with appropriate anisette provider.
     Uses LocalAnisetteProvider if BRIDGE_ANISETTE_SERVER is not set (recommended).
     """
     anisette_server = os.environ.get("BRIDGE_ANISETTE_SERVER")
+    anisette_store = get_anisette_store(account_id)
 
     if anisette_server:
         logger.info("Using remote anisette server: {}", anisette_server)
         anisette = RemoteAnisetteProvider(anisette_server)
     else:
-        logger.info("Using built-in local anisette provider")
-        anisette = LocalAnisetteProvider(libs_path=str(anisette_libs_store))
+        logger.info("Using built-in local anisette provider for account {}", account_id)
+        anisette = LocalAnisetteProvider(libs_path=str(anisette_store))
 
     return AppleAccount(anisette)
 
 
-def load_account() -> AppleAccount:
+def load_account(account_id: int) -> AppleAccount:
     """Load account from JSON store."""
     anisette_server = os.environ.get("BRIDGE_ANISETTE_SERVER")
-    libs_path = None if anisette_server else str(anisette_libs_store)
+    anisette_store = get_anisette_store(account_id)
+    acc_store = get_account_store(account_id)
+
+    libs_path = None if anisette_server else str(anisette_store)
     try:
         return AppleAccount.from_json(acc_store, anisette_libs_path=libs_path)
     except (ValueError, KeyError, json.JSONDecodeError) as e:
-        logger.error("Failed to load account (may be old format): {}", e)
-        logger.error("Please delete {} and re-run findmy-traccar-bridge-init", acc_store)
+        logger.error("Failed to load account {} (may be old format): {}", account_id, e)
+        logger.error("Please delete {} and re-run findmy-traccar-bridge-init {}", acc_store, account_id)
         raise
 
 
@@ -279,6 +344,9 @@ def bridge() -> None:
 
     Callable via the binary `.venv/bin/findmy-traccar-bridge`
     """
+    # Migrate legacy single-account if needed
+    migrate_legacy_account()
+    init_persistent_data()
 
     private_keys = [k for k in (os.environ.get("BRIDGE_PRIVATE_KEYS") or "").split(",") if k]
 
@@ -305,17 +373,39 @@ def bridge() -> None:
 
     logger.info("Target Traccar server: {}", TRACCAR_SERVER)
 
-    if not acc_store.is_file():
-        logger.info(
-            "Login token file not found at '{}'. You must first generate it interactively via "
-            "`docker compose exec bridge .venv/bin/findmy-traccar-bridge-init`",
-            str(acc_store),
-        )
-        while not acc_store.is_file():
-            time.sleep(1)
+    # Discover and load all accounts
+    account_ids = discover_accounts()
 
-    acc = load_account()
-    logger.info("Successfully loaded Apple account")
+    if not account_ids:
+        logger.info(
+            "No accounts found. You must first initialize at least one account via "
+            "`docker compose exec bridge .venv/bin/findmy-traccar-bridge-init`"
+        )
+        # Wait for at least one account to be initialized
+        while not account_ids:
+            time.sleep(1)
+            account_ids = discover_accounts()
+
+    accounts: dict[int, AppleAccount] = {}
+    for account_id in account_ids:
+        try:
+            accounts[account_id] = load_account(account_id)
+            logger.info("Loaded Apple account {}", account_id)
+        except Exception as e:
+            logger.error("Failed to load account {}: {}", account_id, e)
+
+    if not accounts:
+        raise RuntimeError("No accounts could be loaded")
+
+    num_accounts = len(accounts)
+    effective_interval = POLLING_INTERVAL / num_accounts
+
+    logger.info(
+        "Loaded {} account{} - effective update interval: {:.0f} seconds",
+        num_accounts,
+        "" if num_accounts == 1 else "s",
+        effective_interval,
+    )
 
     logger.info("Configured {} device{}:",
                 len(haystack_keys) + len(real_airtags),
@@ -354,41 +444,60 @@ def bridge() -> None:
             create_traccar_device(tid, name)
 
     persistent_data: PersistentData = json.loads(persistent_data_store.read_text())
-    last_traccar_push_timestamp = 0  # not super important, so not persistent
+    last_traccar_push_timestamp = 0.0
 
-    logger.info(
-        "Next Apple API polling in {} seconds ({} UTC)",
-        time_until_next := max(
-            0,
-            int(
-                -(
-                    datetime.datetime.now().timestamp()
-                    - persistent_data["last_apple_api_call"]
-                    - POLLING_INTERVAL
-                )
-            ),
-        ),
-        (
-            datetime.datetime.now() + datetime.timedelta(seconds=time_until_next)
-        ).isoformat(timespec="seconds"),
-    )
+    # Calculate next poll time
+    def get_next_account_to_poll() -> tuple[int, float] | None:
+        """Find the account that should be polled next and how long to wait."""
+        now = datetime.datetime.now().timestamp()
+        best_account = None
+        best_wait_time = float('inf')
+
+        for account_id in accounts:
+            last_poll = persistent_data["account_last_poll"].get(str(account_id), 0)
+            time_since_poll = now - last_poll
+            wait_time = POLLING_INTERVAL - time_since_poll
+
+            if wait_time < best_wait_time:
+                best_wait_time = wait_time
+                best_account = account_id
+
+        if best_account is not None:
+            return (best_account, max(0, best_wait_time))
+        return None
+
+    # Log initial status
+    next_poll = get_next_account_to_poll()
+    if next_poll:
+        account_id, wait_time = next_poll
+        logger.info(
+            "Next Apple API polling (account {}) in {:.0f} seconds ({} UTC)",
+            account_id,
+            wait_time,
+            (datetime.datetime.now() + datetime.timedelta(seconds=wait_time)).isoformat(timespec="seconds"),
+        )
 
     while True:
-        # avoid calling the API too often, otherwise the account might be banned
-        # also makes sure to respect the interval if the process just restarted (e.g. in a bootloop)
-        time_until_next_apple_polling = -(
-            datetime.datetime.now().timestamp()
-            - persistent_data["last_apple_api_call"]
-            - POLLING_INTERVAL
-        )
+        next_poll = get_next_account_to_poll()
         time_until_next_traccar_push = -(
             datetime.datetime.now().timestamp() - last_traccar_push_timestamp - 30
         )
+
+        if next_poll is None:
+            time.sleep(1)
+            continue
+
+        account_to_poll, time_until_next_apple_polling = next_poll
 
         if time_until_next_apple_polling > 0 and time_until_next_traccar_push > 0:
             # sleep short durations so that SIGTERM stops the container
             time.sleep(1)
         elif time_until_next_apple_polling <= 0:
+            acc = accounts[account_to_poll]
+            acc_store = get_account_store(account_to_poll)
+
+            logger.debug("Polling Apple API with account {}...", account_to_poll)
+
             already_uploaded = {
                 (location["id"], location["timestamp"])
                 for location in persistent_data["uploaded_locations"]
@@ -400,9 +509,18 @@ def bridge() -> None:
 
             # Fetch location history using new API
             all_devices = haystack_keys + real_airtags
-            reports_dict = acc.fetch_location_history(all_devices) if all_devices else {}
+            try:
+                reports_dict = acc.fetch_location_history(all_devices) if all_devices else {}
+            except Exception as e:
+                logger.error("Failed to fetch locations with account {}: {}", account_to_poll, e)
+                # Still update last poll time to avoid hammering on errors
+                persistent_data["account_last_poll"][str(account_to_poll)] = int(
+                    datetime.datetime.now().timestamp()
+                )
+                commit(persistent_data)
+                continue
 
-            persistent_data["last_apple_api_call"] = int(
+            persistent_data["account_last_poll"][str(account_to_poll)] = int(
                 datetime.datetime.now().timestamp()
             )
             commit(persistent_data)
@@ -422,10 +540,11 @@ def bridge() -> None:
                     shorthand = device.hashed_adv_key_b64[:8]
 
                 logger.info(
-                    "Received {} locations from device:{} ({})",
+                    "Received {} locations from device:{} ({}) via account {}",
                     len(reports),
                     traccar_id,
                     shorthand,
+                    account_to_poll,
                 )
 
                 for report in reports:
@@ -461,19 +580,16 @@ def bridge() -> None:
             # Save account state (may include refreshed tokens)
             acc.to_json(acc_store)
 
-            logger.info(
-                "Next Apple API polling in {} seconds ({} UTC)",
-                int(
-                    -(
-                        datetime.datetime.now().timestamp()
-                        - persistent_data["last_apple_api_call"]
-                        - POLLING_INTERVAL
-                    )
-                ),
-                datetime.datetime.fromtimestamp(
-                    persistent_data["last_apple_api_call"] + POLLING_INTERVAL
-                ).isoformat(timespec="seconds"),
-            )
+            # Log next poll info
+            next_poll = get_next_account_to_poll()
+            if next_poll:
+                next_account, next_wait = next_poll
+                logger.info(
+                    "Next Apple API polling (account {}) in {:.0f} seconds ({} UTC)",
+                    next_account,
+                    next_wait,
+                    (datetime.datetime.now() + datetime.timedelta(seconds=next_wait)).isoformat(timespec="seconds"),
+                )
 
             commit(persistent_data)
 
@@ -563,8 +679,31 @@ def init() -> None:
     One-time interactive login procedure to answer 2fa challenge and generate API token.
 
     Callable via the binary `.venv/bin/findmy-traccar-bridge-init`
+
+    Usage: findmy-traccar-bridge-init [account_id]
+    If account_id is not provided, defaults to 0.
     """
-    acc = create_account()
+    # Parse account ID from command line args
+    account_id = 0
+    if len(sys.argv) > 1:
+        try:
+            account_id = int(sys.argv[1])
+        except ValueError:
+            print(f"Invalid account ID: {sys.argv[1]}")
+            print("Usage: findmy-traccar-bridge-init [account_id]")
+            sys.exit(1)
+
+    print(f"Initializing account {account_id}...")
+
+    acc_store = get_account_store(account_id)
+
+    if acc_store.is_file():
+        response = input(f"Account {account_id} already exists. Overwrite? [y/N] > ")
+        if response.lower() != 'y':
+            print("Aborted.")
+            sys.exit(0)
+
+    acc = create_account(account_id)
 
     email = input("email?  > ")
     password = getpass.getpass("passwd? > ")
@@ -590,3 +729,5 @@ def init() -> None:
 
     # Use new persistence API
     acc.to_json(acc_store)
+    print(f"Account {account_id} initialized successfully!")
+    print(f"Saved to: {acc_store}")

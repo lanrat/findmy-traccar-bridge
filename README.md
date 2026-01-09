@@ -179,6 +179,29 @@ When enabled, the bridge will automatically create devices in Traccar when it fi
 > [!TIP]
 > Self-hosting Anisette (and setting `BRIDGE_ANISETTE_SERVER`) is optional. The built-in anisette provider is now the default and recommended approach. If you experience authentication issues, you can try using a self-hosted anisette server instead.
 
+### Multiple Accounts
+
+The bridge supports multiple Apple accounts to increase location update frequency without risking any single account being banned. Each account is polled at most once per `BRIDGE_POLL_INTERVAL`, but with multiple accounts the effective update interval is divided among them.
+
+**Example:** With 2 accounts and a 15-minute poll interval, you get updates every ~7.5 minutes (each account still only polled every 15 minutes).
+
+**Initialize additional accounts:**
+```shell
+# Initialize first account (default)
+docker compose exec bridge .venv/bin/findmy-traccar-bridge-init
+
+# Initialize second account
+docker compose exec bridge .venv/bin/findmy-traccar-bridge-init 1
+
+# Initialize third account
+docker compose exec bridge .venv/bin/findmy-traccar-bridge-init 2
+```
+
+Accounts are stored in `/bridge/data/accounts/0/`, `/bridge/data/accounts/1/`, etc. The bridge automatically discovers all initialized accounts on startup.
+
+> [!NOTE]
+> Existing single-account setups are automatically migrated to the new multi-account structure (account 0).
+
 ## Example
 
 An example compose file running the bridge and Traccar locally can be found in the [testing](./testing) directory:
