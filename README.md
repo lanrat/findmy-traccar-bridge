@@ -142,6 +142,7 @@ The script can be configured via the following environment variables:
 | `BRIDGE_JSON_DIR` | No | `/bridge/json_keys` | Directory path for JSON key files (see [FindMy.py examples](https://github.com/malmeloo/FindMy.py/tree/main/examples)) |
 | `BRIDGE_ANISETTE_SERVER` | No | *(built-in)* | URL to a remote anisette server. If not set, uses the built-in local anisette provider (recommended) |
 | `BRIDGE_POLL_INTERVAL` | No | `3600` | Seconds between Apple API queries. Too frequent polling may get your account banned |
+| `BRIDGE_REPORT_ACCURACY` | No | `false` | Set to `true` to include location accuracy (in meters) when reporting to Traccar |
 | `BRIDGE_LOGGING_LEVEL` | No | `INFO` | Logging verbosity level |
 | `BRIDGE_AUTO_CREATE_DEVICES` | No | `false` | Set to `true` to automatically create devices in Traccar when first seen |
 | `BRIDGE_TRACCAR_API` | No | - | Traccar REST API URL (e.g., `http://traccar:8082`). Required for auto-create |

@@ -30,6 +30,9 @@ TRACCAR_API_URL = os.environ.get("BRIDGE_TRACCAR_API", "")  # e.g., http://tracc
 TRACCAR_API_USER = os.environ.get("BRIDGE_TRACCAR_USER", "")
 TRACCAR_API_PASS = os.environ.get("BRIDGE_TRACCAR_PASS", "")
 
+# Optional: Report location accuracy to Traccar (default: false)
+REPORT_ACCURACY = os.environ.get("BRIDGE_REPORT_ACCURACY", "").lower() in ("true", "1", "yes")
+
 
 data_folder = Path("./data/")
 data_folder.mkdir(exist_ok=True)
@@ -604,9 +607,14 @@ def bridge() -> None:
             failed_upload_locations = []
 
             for location in persistent_data["pending_locations"]:
+                # Build upload data, optionally excluding accuracy
+                upload_data = dict(location)
+                if not REPORT_ACCURACY:
+                    upload_data.pop("accuracy", None)
+
                 resp = requests.post(
                     TRACCAR_SERVER,
-                    data=location,
+                    data=upload_data,
                 )
 
                 if resp.status_code == 200:
@@ -618,7 +626,7 @@ def bridge() -> None:
 
                     if create_traccar_device(device_id, device_name):
                         # Retry the upload after creating the device
-                        retry_resp = requests.post(TRACCAR_SERVER, data=location)
+                        retry_resp = requests.post(TRACCAR_SERVER, data=upload_data)
                         if retry_resp.status_code == 200:
                             persistent_data["uploaded_locations"].append(location)
                         else:
