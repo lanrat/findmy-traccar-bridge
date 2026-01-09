@@ -1,0 +1,6 @@
+testing/
+LICENSE
+__pycache__/
+git/
+Dockerfile
+.gitignore
