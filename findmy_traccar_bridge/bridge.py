@@ -202,6 +202,9 @@ class PersistentData(TypedDict):
     uploaded_locations: list[Location]
     # per-account last poll timestamps: {"0": 123456, "1": 123457}
     account_last_poll: dict[str, int]
+    # per-device last uploaded timestamp: {"123456": 1704567890}
+    # prevents re-uploading stale locations after pruning
+    device_last_timestamp: dict[str, int]
 
 
 def init_persistent_data() -> None:
@@ -213,18 +216,29 @@ def init_persistent_data() -> None:
                     pending_locations=[],
                     uploaded_locations=[],
                     account_last_poll={},
+                    device_last_timestamp={},
                 )
             )
         )
     else:
-        # Migrate old format if needed (add account_last_poll if missing)
+        # Migrate old format if needed
         data = json.loads(persistent_data_store.read_text())
+        modified = False
+
         if "account_last_poll" not in data:
             # Migrate from old single-account format
             data["account_last_poll"] = {}
             if "last_apple_api_call" in data:
                 # Move old timestamp to account 0
                 data["account_last_poll"]["0"] = data.pop("last_apple_api_call")
+            modified = True
+
+        if "device_last_timestamp" not in data:
+            # First run after upgrade: initialize empty, first poll will upload all historical data once
+            data["device_last_timestamp"] = {}
+            modified = True
+
+        if modified:
             persistent_data_store.write_text(json.dumps(data))
 
 
@@ -564,8 +578,13 @@ def bridge() -> None:
                     )
 
                     loc_key = (new_location["id"], new_location["timestamp"])
-                    if loc_key not in already_uploaded and loc_key not in already_pending:
-                        persistent_data["pending_locations"].append(new_location)
+                    device_id_str = str(new_location["id"])
+                    last_ts = persistent_data["device_last_timestamp"].get(device_id_str, 0)
+
+                    # Only queue if timestamp is newer than last uploaded for this device
+                    if new_location["timestamp"] > last_ts:
+                        if loc_key not in already_uploaded and loc_key not in already_pending:
+                            persistent_data["pending_locations"].append(new_location)
 
                 logger.debug(
                     "Queued locations from device:{} ({}) for upload",
@@ -619,6 +638,11 @@ def bridge() -> None:
 
                 if resp.status_code == 200:
                     persistent_data["uploaded_locations"].append(location)
+                    # Update device_last_timestamp to prevent re-uploading stale data
+                    device_id_str = str(location["id"])
+                    current_last = persistent_data["device_last_timestamp"].get(device_id_str, 0)
+                    if location["timestamp"] > current_last:
+                        persistent_data["device_last_timestamp"][device_id_str] = location["timestamp"]
                 elif 400 <= resp.status_code < 500:
                     # Client error - device likely doesn't exist in Traccar
                     device_id = location["id"]
@@ -629,6 +653,11 @@ def bridge() -> None:
                         retry_resp = requests.post(TRACCAR_SERVER, data=upload_data)
                         if retry_resp.status_code == 200:
                             persistent_data["uploaded_locations"].append(location)
+                            # Update device_last_timestamp to prevent re-uploading stale data
+                            device_id_str = str(location["id"])
+                            current_last = persistent_data["device_last_timestamp"].get(device_id_str, 0)
+                            if location["timestamp"] > current_last:
+                                persistent_data["device_last_timestamp"][device_id_str] = location["timestamp"]
                         else:
                             logger.warning(
                                 "Upload ({}, {}) failed after device creation: {}",
