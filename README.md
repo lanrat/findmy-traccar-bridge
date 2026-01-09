@@ -136,13 +136,17 @@ The script can be configured via the following environment variables:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `BRIDGE_TRACCAR_SERVER` | Yes | - | URL to your Traccar server (e.g., `http://traccar:5055`) |
+| `BRIDGE_TRACCAR_SERVER` | Yes | - | URL to your Traccar server OsmAnd endpoint (e.g., `http://traccar:5055`) |
 | `BRIDGE_PRIVATE_KEYS` | No | - | Comma-separated base64 encoded private keys for OpenHaystack beacons |
 | `BRIDGE_PLIST_DIR` | No | `/bridge/plists` | Directory path for [decrypted plist files](https://github.com/malmeloo/FindMy.py/issues/31) |
 | `BRIDGE_JSON_DIR` | No | `/bridge/json_keys` | Directory path for JSON key files (see [FindMy.py examples](https://github.com/malmeloo/FindMy.py/tree/main/examples)) |
 | `BRIDGE_ANISETTE_SERVER` | No | *(built-in)* | URL to a remote anisette server. If not set, uses the built-in local anisette provider (recommended) |
 | `BRIDGE_POLL_INTERVAL` | No | `3600` | Seconds between Apple API queries. Too frequent polling may get your account banned |
 | `BRIDGE_LOGGING_LEVEL` | No | `INFO` | Logging verbosity level |
+| `BRIDGE_AUTO_CREATE_DEVICES` | No | `false` | Set to `true` to automatically create devices in Traccar when first seen |
+| `BRIDGE_TRACCAR_API` | No | - | Traccar REST API URL (e.g., `http://traccar:8082`). Required for auto-create |
+| `BRIDGE_TRACCAR_USER` | No | - | Traccar admin username for API authentication. Required for auto-create |
+| `BRIDGE_TRACCAR_PASS` | No | - | Traccar admin password for API authentication. Required for auto-create |
 
 ### Device Configuration
 
@@ -154,6 +158,23 @@ You need at least one of the following configured:
 ### Battery Level
 
 The bridge reports battery level to Traccar as the `batt` attribute (percentage: 100=Full, 75=Medium, 50=Low, 25=Very Low).
+
+### Auto-Create Devices
+
+By default, devices must be manually created in Traccar before location updates will be accepted. You can enable automatic device creation by setting the following environment variables:
+
+```yaml
+environment:
+  BRIDGE_AUTO_CREATE_DEVICES: "true"
+  BRIDGE_TRACCAR_API: "http://traccar:8082"
+  BRIDGE_TRACCAR_USER: "admin@example.com"
+  BRIDGE_TRACCAR_PASS: "your-password"
+```
+
+When enabled, the bridge will automatically create devices in Traccar when it first tries to upload a location. Devices will be named based on their AirTag name/identifier or "Haystack" prefix for OpenHaystack beacons.
+
+> [!NOTE]
+> Auto-create uses the Traccar REST API (port 8082) which requires authentication, while location updates use the OsmAnd protocol (port 5055) which does not require authentication.
 
 > [!TIP]
 > Self-hosting Anisette (and setting `BRIDGE_ANISETTE_SERVER`) is optional. The built-in anisette provider is now the default and recommended approach. If you experience authentication issues, you can try using a self-hosted anisette server instead.

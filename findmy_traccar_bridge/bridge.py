@@ -24,6 +24,12 @@ logger.add(sys.stderr, level=os.environ.get("BRIDGE_LOGGING_LEVEL", "INFO"))
 
 POLLING_INTERVAL = int(os.environ.get("BRIDGE_POLL_INTERVAL", 60 * 60))
 
+# Auto-create devices in Traccar (opt-in)
+AUTO_CREATE_DEVICES = os.environ.get("BRIDGE_AUTO_CREATE_DEVICES", "").lower() in ("true", "1", "yes")
+TRACCAR_API_URL = os.environ.get("BRIDGE_TRACCAR_API", "")  # e.g., http://traccar:8082
+TRACCAR_API_USER = os.environ.get("BRIDGE_TRACCAR_USER", "")
+TRACCAR_API_PASS = os.environ.get("BRIDGE_TRACCAR_PASS", "")
+
 
 data_folder = Path("./data/")
 data_folder.mkdir(exist_ok=True)
@@ -52,6 +58,80 @@ def get_battery_level(status: int) -> tuple[int, str]:
     """Extract battery level from location report status byte."""
     battery_id = (status >> 6) & 0b11
     return BATTERY_LEVELS.get(battery_id, 0), BATTERY_NAMES.get(battery_id, "Unknown")
+
+
+# Cache of devices already created in Traccar (to avoid repeated API calls)
+_created_devices: set[int] = set()
+
+
+def create_traccar_device(traccar_id: int, name: str) -> bool:
+    """
+    Create a device in Traccar via the REST API.
+
+    Args:
+        traccar_id: The unique identifier for the device
+        name: Human-readable name for the device
+
+    Returns:
+        True if device was created successfully or already exists, False otherwise
+    """
+    if not AUTO_CREATE_DEVICES:
+        return False
+
+    if traccar_id in _created_devices:
+        return True
+
+    if not TRACCAR_API_URL or not TRACCAR_API_USER or not TRACCAR_API_PASS:
+        logger.warning(
+            "Auto-create devices enabled but BRIDGE_TRACCAR_API, BRIDGE_TRACCAR_USER, "
+            "or BRIDGE_TRACCAR_PASS not set"
+        )
+        return False
+
+    api_url = TRACCAR_API_URL.rstrip("/")
+
+    try:
+        # First check if device already exists
+        resp = requests.get(
+            f"{api_url}/api/devices",
+            auth=(TRACCAR_API_USER, TRACCAR_API_PASS),
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            devices = resp.json()
+            for device in devices:
+                if str(device.get("uniqueId")) == str(traccar_id):
+                    logger.debug("Device {} already exists in Traccar", traccar_id)
+                    _created_devices.add(traccar_id)
+                    return True
+
+        # Create the device
+        resp = requests.post(
+            f"{api_url}/api/devices",
+            auth=(TRACCAR_API_USER, TRACCAR_API_PASS),
+            json={
+                "name": name,
+                "uniqueId": str(traccar_id),
+            },
+            timeout=30,
+        )
+
+        if resp.status_code == 200:
+            logger.info("Created device in Traccar: {} (ID: {})", name, traccar_id)
+            _created_devices.add(traccar_id)
+            return True
+        else:
+            logger.warning(
+                "Failed to create device {} in Traccar: {} {}",
+                traccar_id,
+                resp.status_code,
+                resp.text,
+            )
+            return False
+
+    except requests.RequestException as e:
+        logger.error("Error communicating with Traccar API: {}", e)
+        return False
 
 
 class Location(TypedDict):
@@ -257,6 +337,22 @@ def bridge() -> None:
             traccar_id
         )
 
+    # Build device name mapping for auto-create feature
+    device_names: dict[int, str] = {}
+    for key in haystack_keys:
+        tid = int.from_bytes(key.hashed_adv_key_bytes) % 1_000_000
+        device_names[tid] = f"Haystack {key.hashed_adv_key_b64[:8]}"
+    for airtag in real_airtags:
+        identifier = airtag.identifier or airtag.name or "unknown"
+        tid = int.from_bytes(identifier.encode()[:8], 'big') % 1_000_000
+        device_names[tid] = airtag.name or airtag.identifier or f"AirTag {tid}"
+
+    # Proactively create all devices in Traccar at startup
+    if AUTO_CREATE_DEVICES:
+        logger.info("Ensuring all devices exist in Traccar...")
+        for tid, name in device_names.items():
+            create_traccar_device(tid, name)
+
     persistent_data: PersistentData = json.loads(persistent_data_store.read_text())
     last_traccar_push_timestamp = 0  # not super important, so not persistent
 
@@ -399,27 +495,53 @@ def bridge() -> None:
 
                 if resp.status_code == 200:
                     persistent_data["uploaded_locations"].append(location)
+                elif 400 <= resp.status_code < 500:
+                    # Client error - device likely doesn't exist in Traccar
+                    device_id = location["id"]
+                    device_name = device_names.get(device_id, f"FindMy Device {device_id}")
+
+                    if create_traccar_device(device_id, device_name):
+                        # Retry the upload after creating the device
+                        retry_resp = requests.post(TRACCAR_SERVER, data=location)
+                        if retry_resp.status_code == 200:
+                            persistent_data["uploaded_locations"].append(location)
+                        else:
+                            logger.warning(
+                                "Upload ({}, {}) failed after device creation: {}",
+                                location["id"],
+                                location["timestamp"],
+                                retry_resp.status_code,
+                            )
+                            failed_upload_locations.append(location)
+                    else:
+                        # Auto-create not enabled or failed - queue for retry
+                        failed_upload_locations.append(location)
                 else:
-                    if resp.status_code != 400:
-                        logger.warning(
-                            "Upload ({}, {}) failed with unexpected code {}",
-                            location["id"],
-                            location["timestamp"],
-                            resp.status_code,
-                        )
-                        logger.debug("API returned {}", resp.text)
-                    # device id has not been claimed yet in the traccar UI. remember to retry
+                    logger.warning(
+                        "Upload ({}, {}) failed with code {}",
+                        location["id"],
+                        location["timestamp"],
+                        resp.status_code,
+                    )
+                    logger.debug("API returned {}", resp.text)
                     failed_upload_locations.append(location)
 
             unique_failed_devices = {
                 location["id"] for location in failed_upload_locations
             }
             if len(unique_failed_devices) > 0:
-                logger.warning(
-                    "Failed to upload locations for devices {}. They might need to be claimed in the traccar UI first. "
-                    "Reupload will be attempted.",
-                    unique_failed_devices,
-                )
+                if AUTO_CREATE_DEVICES:
+                    logger.warning(
+                        "Failed to upload locations for devices {}. Auto-create may have failed. "
+                        "Reupload will be attempted.",
+                        unique_failed_devices,
+                    )
+                else:
+                    logger.warning(
+                        "Failed to upload locations for devices {}. They may need to be claimed in the Traccar UI, "
+                        "or enable BRIDGE_AUTO_CREATE_DEVICES. Reupload will be attempted.",
+                        unique_failed_devices,
+                    )
 
             persistent_data["pending_locations"] = failed_upload_locations
 
