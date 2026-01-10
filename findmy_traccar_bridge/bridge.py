@@ -444,15 +444,19 @@ def bridge() -> None:
             traccar_id
         )
 
-    # Build device name mapping for auto-create feature
+    # Build device name and identifier mappings
     device_names: dict[int, str] = {}
+    device_identifiers: dict[int, str] = {}  # Full identifier for Traccar attributes
     for key in haystack_keys:
         tid = int.from_bytes(key.hashed_adv_key_bytes) % 1_000_000
         device_names[tid] = f"Haystack {key.hashed_adv_key_b64[:8]}"
+        device_identifiers[tid] = key.hashed_adv_key_b64  # Full hashed key
     for airtag in real_airtags:
         identifier = airtag.identifier or airtag.name or "unknown"
         tid = int.from_bytes(identifier.encode()[:8], 'big') % 1_000_000
         device_names[tid] = airtag.name or airtag.identifier or f"AirTag {tid}"
+        if airtag.identifier:
+            device_identifiers[tid] = airtag.identifier
 
     # Proactively create all devices in Traccar at startup
     if AUTO_CREATE_DEVICES:
@@ -630,6 +634,11 @@ def bridge() -> None:
                 upload_data = dict(location)
                 if not REPORT_ACCURACY:
                     upload_data.pop("accuracy", None)
+
+                # Add full identifier as attribute if available
+                device_id = location["id"]
+                if device_id in device_identifiers:
+                    upload_data["findmy_id"] = device_identifiers[device_id]
 
                 resp = requests.post(
                     TRACCAR_SERVER,
