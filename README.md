@@ -198,7 +198,10 @@ docker compose exec bridge .venv/bin/findmy-traccar-bridge-init 1
 docker compose exec bridge .venv/bin/findmy-traccar-bridge-init 2
 ```
 
-Accounts are stored in `/bridge/data/accounts/0/`, `/bridge/data/accounts/1/`, etc. The bridge automatically discovers all initialized accounts on startup.
+Accounts are stored in `/bridge/data/accounts/0/`, `/bridge/data/accounts/1/`, etc. The bridge discovers all initialized accounts on startup.
+
+> [!IMPORTANT]
+> After adding a new account, restart the bridge for it to take effect: `docker compose restart bridge`
 
 > [!NOTE]
 > Existing single-account setups are automatically migrated to the new multi-account structure (account 0).
