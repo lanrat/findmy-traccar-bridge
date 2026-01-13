@@ -1,7 +1,8 @@
+"""FindMy to Traccar bridge - main entry point."""
+
 import datetime
 import getpass
 import json
-import logging
 import os
 import sys
 import time
@@ -13,215 +14,52 @@ from findmy import KeyPair, FindMyAccessory
 from findmy.reports import (
     AppleAccount,
     LoginState,
-    LocalAnisetteProvider,
-    RemoteAnisetteProvider,
     SmsSecondFactorMethod,
     TrustedDeviceSecondFactorMethod,
 )
 from loguru import logger
 
+# Import logging config first to set up logging before other modules
+from findmy_traccar_bridge import logging_config  # noqa: F401
 
-# Intercept standard library logging and redirect to loguru
-class InterceptHandler(logging.Handler):
-    def emit(self, record: logging.LogRecord) -> None:
-        # Get corresponding Loguru level if it exists
-        try:
-            level = logger.level(record.levelname).name
-        except ValueError:
-            level = record.levelno
+# Import from refactored modules
+from findmy_traccar_bridge.accounts import (
+    create_account,
+    discover_accounts,
+    get_account_store,
+    load_account,
+    migrate_legacy_account,
+)
+from findmy_traccar_bridge.devices import (
+    get_battery_level,
+    load_airtags_from_directory,
+    load_airtags_from_json_directory,
+)
+from findmy_traccar_bridge.traccar import (
+    AUTO_CREATE_DEVICES,
+    Location,
+    create_traccar_device,
+)
 
-        # Patch loguru record with the actual source info from the stdlib LogRecord
-        def patcher(loguru_record: dict) -> None:
-            loguru_record["file"] = type("File", (), {"name": record.filename, "path": record.pathname})()
-            loguru_record["line"] = record.lineno
-            loguru_record["function"] = record.funcName
-            loguru_record["name"] = record.name
-
-        logger.patch(patcher).opt(depth=0, exception=record.exc_info).log(level, record.getMessage())
-
-
-# Configure loguru
-logger.remove()
-logger.add(sys.stderr, level=os.environ.get("BRIDGE_LOGGING_LEVEL", "INFO"))
-
-# Redirect findmy library logs to loguru
-logging.getLogger("findmy").setLevel(os.environ.get("BRIDGE_LOGGING_LEVEL", "INFO"))
-logging.getLogger("findmy").addHandler(InterceptHandler())
 
 POLLING_INTERVAL = int(os.environ.get("BRIDGE_POLL_INTERVAL", 60 * 60))
 
-# Auto-create devices in Traccar (opt-in)
-AUTO_CREATE_DEVICES = os.environ.get("BRIDGE_AUTO_CREATE_DEVICES", "").lower() in ("true", "1", "yes")
-TRACCAR_API_URL = os.environ.get("BRIDGE_TRACCAR_API", "")  # e.g., http://traccar:8082
-TRACCAR_API_USER = os.environ.get("BRIDGE_TRACCAR_USER", "")
-TRACCAR_API_PASS = os.environ.get("BRIDGE_TRACCAR_PASS", "")
-
 # Optional: Report location accuracy to Traccar (default: false)
-REPORT_ACCURACY = os.environ.get("BRIDGE_REPORT_ACCURACY", "").lower() in ("true", "1", "yes")
+REPORT_ACCURACY = os.environ.get("BRIDGE_REPORT_ACCURACY", "").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
-
+# Persistent data storage
 data_folder = Path("./data/")
 data_folder.mkdir(exist_ok=True)
-accounts_folder = data_folder / "accounts"
-accounts_folder.mkdir(exist_ok=True)
 persistent_data_store = data_folder / "persistent_data.json"
-
-# Legacy paths for backwards compatibility / migration
-legacy_acc_store = data_folder / "account.json"
-legacy_anisette_store = data_folder / "ani_libs.bin"
-
-
-def get_account_folder(account_id: int) -> Path:
-    """Get the folder path for a specific account."""
-    folder = accounts_folder / str(account_id)
-    folder.mkdir(exist_ok=True)
-    return folder
-
-
-def get_account_store(account_id: int) -> Path:
-    """Get the account.json path for a specific account."""
-    return get_account_folder(account_id) / "account.json"
-
-
-def get_anisette_store(account_id: int) -> Path:
-    """Get the anisette libs path for a specific account."""
-    return get_account_folder(account_id) / "ani_libs.bin"
-
-
-def migrate_legacy_account() -> None:
-    """Migrate legacy single-account format to new multi-account structure."""
-    if legacy_acc_store.is_file() and not get_account_store(0).is_file():
-        logger.info("Migrating legacy account to multi-account structure...")
-        account_0_folder = get_account_folder(0)
-
-        # Move account.json
-        legacy_acc_store.rename(account_0_folder / "account.json")
-        logger.info("Migrated account.json to accounts/0/")
-
-        # Move anisette libs if they exist
-        if legacy_anisette_store.is_file():
-            legacy_anisette_store.rename(account_0_folder / "ani_libs.bin")
-            logger.info("Migrated ani_libs.bin to accounts/0/")
-
-
-def discover_accounts() -> list[int]:
-    """Discover all initialized accounts by scanning the accounts directory."""
-    account_ids = []
-    for item in accounts_folder.iterdir():
-        if item.is_dir() and (item / "account.json").is_file():
-            try:
-                account_ids.append(int(item.name))
-            except ValueError:
-                continue
-    return sorted(account_ids)
-
-
-# Battery level mapping from status byte (bits 6-7)
-BATTERY_LEVELS = {
-    0b00: 100,  # Full
-    0b01: 75,   # Medium
-    0b10: 50,   # Low
-    0b11: 25,   # Very Low
-}
-
-BATTERY_NAMES = {
-    0b00: "Full",
-    0b01: "Medium",
-    0b10: "Low",
-    0b11: "Very Low",
-}
-
-
-def get_battery_level(status: int) -> tuple[int, str]:
-    """Extract battery level from location report status byte."""
-    battery_id = (status >> 6) & 0b11
-    return BATTERY_LEVELS.get(battery_id, 0), BATTERY_NAMES.get(battery_id, "Unknown")
-
-
-# Cache of devices already created in Traccar (to avoid repeated API calls)
-_created_devices: set[int] = set()
-
-
-def create_traccar_device(traccar_id: int, name: str) -> bool:
-    """
-    Create a device in Traccar via the REST API.
-
-    Args:
-        traccar_id: The unique identifier for the device
-        name: Human-readable name for the device
-
-    Returns:
-        True if device was created successfully or already exists, False otherwise
-    """
-    if not AUTO_CREATE_DEVICES:
-        return False
-
-    if traccar_id in _created_devices:
-        return True
-
-    if not TRACCAR_API_URL or not TRACCAR_API_USER or not TRACCAR_API_PASS:
-        logger.warning(
-            "Auto-create devices enabled but BRIDGE_TRACCAR_API, BRIDGE_TRACCAR_USER, "
-            "or BRIDGE_TRACCAR_PASS not set"
-        )
-        return False
-
-    api_url = TRACCAR_API_URL.rstrip("/")
-
-    try:
-        # First check if device already exists
-        resp = requests.get(
-            f"{api_url}/api/devices",
-            auth=(TRACCAR_API_USER, TRACCAR_API_PASS),
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            devices = resp.json()
-            for device in devices:
-                if str(device.get("uniqueId")) == str(traccar_id):
-                    logger.debug("Device {} already exists in Traccar", traccar_id)
-                    _created_devices.add(traccar_id)
-                    return True
-
-        # Create the device
-        resp = requests.post(
-            f"{api_url}/api/devices",
-            auth=(TRACCAR_API_USER, TRACCAR_API_PASS),
-            json={
-                "name": name,
-                "uniqueId": str(traccar_id),
-            },
-            timeout=30,
-        )
-
-        if resp.status_code == 200:
-            logger.info("Created device in Traccar: {} (ID: {})", name, traccar_id)
-            _created_devices.add(traccar_id)
-            return True
-        else:
-            logger.warning(
-                "Failed to create device {} in Traccar: {} {}",
-                traccar_id,
-                resp.status_code,
-                resp.text,
-            )
-            return False
-
-    except requests.RequestException as e:
-        logger.error("Error communicating with Traccar API: {}", e)
-        return False
-
-
-class Location(TypedDict):
-    id: int
-    timestamp: int
-    lat: float
-    lon: float
-    batt: int  # Battery percentage (0-100)
-    accuracy: int  # Horizontal accuracy in meters
 
 
 class PersistentData(TypedDict):
+    """Persistent state for the bridge."""
+
     # rejected locations by traccar (id has not been claimed by a user), will keep retrying to upload these
     pending_locations: list[Location]
     # recently uploaded locations used for deduplication
@@ -269,116 +107,8 @@ def init_persistent_data() -> None:
 
 
 def commit(persistent_data: PersistentData) -> None:
+    """Save persistent data to disk."""
     persistent_data_store.write_text(json.dumps(persistent_data))
-
-
-def load_airtags_from_directory(directory_path: str | None) -> list[FindMyAccessory]:
-    """
-    Load all FindMyAccessory objects from .plist files in the specified directory.
-
-    Args:
-        directory_path: Path to the directory containing .plist files
-
-    Returns:
-        List of loaded FindMyAccessory objects
-    """
-    if not directory_path:
-        return []
-
-    airtags = []
-    dir_path = Path(directory_path)
-
-    if not dir_path.exists():
-        # Only log as error if it's not the default path
-        if directory_path != "/bridge/plists":
-            logger.error("Plist directory does not exist: {}", directory_path)
-        return []
-
-    if not dir_path.is_dir():
-        logger.error("Plist path exists but is not a directory: {}", directory_path)
-        return []
-
-    plist_files = list(dir_path.glob("*.plist"))
-    for plist_path in plist_files:
-        try:
-            with plist_path.open("rb") as f:
-                airtags.append(FindMyAccessory.from_plist(f))
-        except Exception as e:
-            logger.error("Failed to load plist file {}: {}", plist_path, str(e))
-
-    return airtags
-
-
-def load_airtags_from_json_directory(directory_path: str | None) -> tuple[list[FindMyAccessory], dict[FindMyAccessory, Path]]:
-    """
-    Load FindMyAccessory objects from .json key files in the specified directory.
-
-    Args:
-        directory_path: Path to the directory containing .json key files
-
-    Returns:
-        Tuple of (list of accessories, dict mapping accessory to its file path)
-    """
-    if not directory_path:
-        return [], {}
-
-    airtags = []
-    airtag_paths: dict[FindMyAccessory, Path] = {}
-    dir_path = Path(directory_path)
-
-    if not dir_path.exists():
-        # Only log as error if it's not the default path
-        if directory_path != "/bridge/json_keys":
-            logger.error("JSON keys directory does not exist: {}", directory_path)
-        return [], {}
-
-    if not dir_path.is_dir():
-        logger.error("JSON keys path is not a directory: {}", directory_path)
-        return [], {}
-
-    for json_path in dir_path.glob("*.json"):
-        try:
-            airtag = FindMyAccessory.from_json(json_path)
-            airtags.append(airtag)
-            airtag_paths[airtag] = json_path
-            logger.debug("Loaded JSON key file: {}", json_path.name)
-        except Exception as e:
-            logger.error("Failed to load JSON key file {}: {}", json_path, str(e))
-
-    return airtags, airtag_paths
-
-
-def create_account(account_id: int) -> AppleAccount:
-    """
-    Create an AppleAccount with appropriate anisette provider.
-    Uses LocalAnisetteProvider if BRIDGE_ANISETTE_SERVER is not set (recommended).
-    """
-    anisette_server = os.environ.get("BRIDGE_ANISETTE_SERVER")
-    anisette_store = get_anisette_store(account_id)
-
-    if anisette_server:
-        logger.info("Using remote anisette server: {}", anisette_server)
-        anisette = RemoteAnisetteProvider(anisette_server)
-    else:
-        logger.info("Using built-in local anisette provider for account {}", account_id)
-        anisette = LocalAnisetteProvider(libs_path=str(anisette_store))
-
-    return AppleAccount(anisette)
-
-
-def load_account(account_id: int) -> AppleAccount:
-    """Load account from JSON store."""
-    anisette_server = os.environ.get("BRIDGE_ANISETTE_SERVER")
-    anisette_store = get_anisette_store(account_id)
-    acc_store = get_account_store(account_id)
-
-    libs_path = None if anisette_server else str(anisette_store)
-    try:
-        return AppleAccount.from_json(acc_store, anisette_libs_path=libs_path)
-    except (ValueError, KeyError, json.JSONDecodeError) as e:
-        logger.error("Failed to load account {} (may be old format): {}", account_id, e)
-        logger.error("Please delete {} and re-run findmy-traccar-bridge-init {}", acc_store, account_id)
-        raise
 
 
 def bridge() -> None:
@@ -391,7 +121,9 @@ def bridge() -> None:
     migrate_legacy_account()
     init_persistent_data()
 
-    private_keys = [k for k in (os.environ.get("BRIDGE_PRIVATE_KEYS") or "").split(",") if k]
+    private_keys = [
+        k for k in (os.environ.get("BRIDGE_PRIVATE_KEYS") or "").split(",") if k
+    ]
 
     # Directory locations
     plist_dir = os.environ.get("BRIDGE_PLIST_DIR", "/bridge/plists")
@@ -410,7 +142,9 @@ def bridge() -> None:
             "  3. Mount .json key files to /bridge/json_keys (or set BRIDGE_JSON_DIR)"
         )
 
-    logger.info("Loaded {} plist AirTags, {} JSON AirTags", len(plist_airtags), len(json_airtags))
+    logger.info(
+        "Loaded {} plist AirTags, {} JSON AirTags", len(plist_airtags), len(json_airtags)
+    )
 
     TRACCAR_SERVER = os.environ["BRIDGE_TRACCAR_SERVER"]
 
@@ -436,7 +170,9 @@ def bridge() -> None:
             acc = load_account(account_id)
             accounts[account_id] = acc
             account_names[account_id] = acc.account_name or f"account_{account_id}"
-            logger.info("Loaded Apple account {}: {}", account_id, account_names[account_id])
+            logger.info(
+                "Loaded Apple account {}: {}", account_id, account_names[account_id]
+            )
         except Exception as e:
             logger.error("Failed to load account {}: {}", account_id, e)
 
@@ -453,9 +189,11 @@ def bridge() -> None:
         effective_interval,
     )
 
-    logger.info("Configured {} device{}:",
-                len(haystack_keys) + len(real_airtags),
-                "" if len(haystack_keys) + len(real_airtags) == 1 else "s")
+    logger.info(
+        "Configured {} device{}:",
+        len(haystack_keys) + len(real_airtags),
+        "" if len(haystack_keys) + len(real_airtags) == 1 else "s",
+    )
     for key in haystack_keys:
         logger.info(
             "   Haystack device | Traccar ID {} | Key: {}",
@@ -465,7 +203,7 @@ def bridge() -> None:
     for airtag in real_airtags:
         identifier = airtag.identifier or airtag.name or "unknown"
         display_name = airtag.name or airtag.identifier or "unknown"
-        traccar_id = int.from_bytes(identifier.encode()[:8], 'big') % 1_000_000
+        traccar_id = int.from_bytes(identifier.encode()[:8], "big") % 1_000_000
         logger.info(
             "   FindMy device   | Traccar ID {} | Name: {} | ID: {}",
             traccar_id,
@@ -482,7 +220,7 @@ def bridge() -> None:
         device_identifiers[tid] = key.hashed_adv_key_b64  # Full hashed key
     for airtag in real_airtags:
         identifier = airtag.identifier or airtag.name or "unknown"
-        tid = int.from_bytes(identifier.encode()[:8], 'big') % 1_000_000
+        tid = int.from_bytes(identifier.encode()[:8], "big") % 1_000_000
         device_names[tid] = airtag.name or airtag.identifier or f"AirTag {tid}"
         if airtag.identifier:
             device_identifiers[tid] = airtag.identifier
@@ -518,8 +256,7 @@ def bridge() -> None:
 
         # Find when any account was last polled (for spacing)
         all_last_polls = [
-            persistent_data["account_last_poll"].get(str(aid), 0)
-            for aid in accounts
+            persistent_data["account_last_poll"].get(str(aid), 0) for aid in accounts
         ]
         last_any_poll = max(all_last_polls) if all_last_polls else 0
         wait_time = max(0, effective_interval - (now - last_any_poll))
@@ -538,7 +275,9 @@ def bridge() -> None:
         account_id,
         account_names.get(account_id, "unknown"),
         wait_time,
-        (datetime.datetime.now() + datetime.timedelta(seconds=wait_time)).isoformat(timespec="seconds"),
+        (
+            datetime.datetime.now() + datetime.timedelta(seconds=wait_time)
+        ).isoformat(timespec="seconds"),
     )
 
     while True:
@@ -554,7 +293,11 @@ def bridge() -> None:
             acc = accounts[account_to_poll]
             acc_store = get_account_store(account_to_poll)
 
-            logger.info("Polling Apple API with account {} ({})...", account_to_poll, account_names.get(account_to_poll, "unknown"))
+            logger.info(
+                "Polling Apple API with account {} ({})...",
+                account_to_poll,
+                account_names.get(account_to_poll, "unknown"),
+            )
 
             already_uploaded = {
                 (location["id"], location["timestamp"])
@@ -568,9 +311,16 @@ def bridge() -> None:
             # Fetch location history using new API
             all_devices = haystack_keys + real_airtags
             try:
-                reports_dict = acc.fetch_location_history(all_devices) if all_devices else {}
+                reports_dict = (
+                    acc.fetch_location_history(all_devices) if all_devices else {}
+                )
             except Exception as e:
-                logger.error("Failed to fetch locations with account {} ({}): {}", account_to_poll, account_names.get(account_to_poll, "unknown"), e)
+                logger.error(
+                    "Failed to fetch locations with account {} ({}): {}",
+                    account_to_poll,
+                    account_names.get(account_to_poll, "unknown"),
+                    e,
+                )
                 # Still update last poll time to avoid hammering on errors
                 persistent_data["account_last_poll"][str(account_to_poll)] = int(
                     datetime.datetime.now().timestamp()
@@ -591,7 +341,9 @@ def bridge() -> None:
                 # Determine Traccar ID based on device type
                 if isinstance(device, FindMyAccessory):
                     identifier = device.identifier or device.name or str(id(device))
-                    traccar_id = int.from_bytes(identifier.encode()[:8], 'big') % 1_000_000
+                    traccar_id = (
+                        int.from_bytes(identifier.encode()[:8], "big") % 1_000_000
+                    )
                     shorthand = (device.name or device.identifier or "accessory")[:16]
                 else:
                     # Haystack device - use hashed key
@@ -621,11 +373,16 @@ def bridge() -> None:
 
                     loc_key = (new_location["id"], new_location["timestamp"])
                     device_id_str = str(new_location["id"])
-                    last_ts = persistent_data["device_last_timestamp"].get(device_id_str, 0)
+                    last_ts = persistent_data["device_last_timestamp"].get(
+                        device_id_str, 0
+                    )
 
                     # Only queue if timestamp is newer than last uploaded for this device
                     if new_location["timestamp"] > last_ts:
-                        if loc_key not in already_uploaded and loc_key not in already_pending:
+                        if (
+                            loc_key not in already_uploaded
+                            and loc_key not in already_pending
+                        ):
                             persistent_data["pending_locations"].append(new_location)
 
                 logger.debug(
@@ -654,7 +411,9 @@ def bridge() -> None:
                 next_account,
                 account_names.get(next_account, "unknown"),
                 next_wait,
-                (datetime.datetime.now() + datetime.timedelta(seconds=next_wait)).isoformat(timespec="seconds"),
+                (
+                    datetime.datetime.now() + datetime.timedelta(seconds=next_wait)
+                ).isoformat(timespec="seconds"),
             )
 
             commit(persistent_data)
@@ -689,9 +448,13 @@ def bridge() -> None:
                     persistent_data["uploaded_locations"].append(location)
                     # Update device_last_timestamp to prevent re-uploading stale data
                     device_id_str = str(location["id"])
-                    current_last = persistent_data["device_last_timestamp"].get(device_id_str, 0)
+                    current_last = persistent_data["device_last_timestamp"].get(
+                        device_id_str, 0
+                    )
                     if location["timestamp"] > current_last:
-                        persistent_data["device_last_timestamp"][device_id_str] = location["timestamp"]
+                        persistent_data["device_last_timestamp"][
+                            device_id_str
+                        ] = location["timestamp"]
                 elif 400 <= resp.status_code < 500:
                     # Client error - device likely doesn't exist in Traccar
                     device_id = location["id"]
@@ -704,9 +467,13 @@ def bridge() -> None:
                             persistent_data["uploaded_locations"].append(location)
                             # Update device_last_timestamp to prevent re-uploading stale data
                             device_id_str = str(location["id"])
-                            current_last = persistent_data["device_last_timestamp"].get(device_id_str, 0)
+                            current_last = persistent_data["device_last_timestamp"].get(
+                                device_id_str, 0
+                            )
                             if location["timestamp"] > current_last:
-                                persistent_data["device_last_timestamp"][device_id_str] = location["timestamp"]
+                                persistent_data["device_last_timestamp"][
+                                    device_id_str
+                                ] = location["timestamp"]
                         else:
                             logger.warning(
                                 "Upload ({}, {}) failed after device creation: {}",
@@ -751,7 +518,8 @@ def bridge() -> None:
             # Keep only locations newer than 2x polling interval for deduplication
             cutoff = int(datetime.datetime.now().timestamp()) - (POLLING_INTERVAL * 2)
             persistent_data["uploaded_locations"] = [
-                loc for loc in persistent_data["uploaded_locations"]
+                loc
+                for loc in persistent_data["uploaded_locations"]
                 if loc["timestamp"] > cutoff
             ]
 
@@ -785,7 +553,7 @@ def init() -> None:
 
     if acc_store.is_file():
         response = input(f"Account {account_id} already exists. Overwrite? [y/N] > ")
-        if response.lower() != 'y':
+        if response.lower() != "y":
             print("Aborted.")
             sys.exit(0)
 
