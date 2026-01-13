@@ -30,13 +30,14 @@ class InterceptHandler(logging.Handler):
         except ValueError:
             level = record.levelno
 
-        # Find caller from where originated the logged message
-        frame, depth = logging.currentframe(), 2
-        while frame and frame.f_code.co_filename == logging.__file__:
-            frame = frame.f_back
-            depth += 1
+        # Patch loguru record with the actual source info from the stdlib LogRecord
+        def patcher(loguru_record: dict) -> None:
+            loguru_record["file"] = type("File", (), {"name": record.filename, "path": record.pathname})()
+            loguru_record["line"] = record.lineno
+            loguru_record["function"] = record.funcName
+            loguru_record["name"] = record.name
 
-        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+        logger.patch(patcher).opt(depth=0, exception=record.exc_info).log(level, record.getMessage())
 
 
 # Configure loguru
@@ -457,19 +458,19 @@ def bridge() -> None:
                 "" if len(haystack_keys) + len(real_airtags) == 1 else "s")
     for key in haystack_keys:
         logger.info(
-            "   Haystack device\t| Private key: {}[...]\t\t|\tTraccar ID {}",
-            key.hashed_adv_key_b64[:16],
-            int.from_bytes(key.hashed_adv_key_bytes) % 1_000_000
+            "   Haystack device | Traccar ID {} | Key: {}",
+            int.from_bytes(key.hashed_adv_key_bytes) % 1_000_000,
+            key.hashed_adv_key_b64,
         )
     for airtag in real_airtags:
         identifier = airtag.identifier or airtag.name or "unknown"
         display_name = airtag.name or airtag.identifier or "unknown"
         traccar_id = int.from_bytes(identifier.encode()[:8], 'big') % 1_000_000
         logger.info(
-            "   FindMy device\t\t| {}: {}[...]\t|\tTraccar ID {}",
-            "name" if airtag.name else "identifier",
-            display_name[:16],
-            traccar_id
+            "   FindMy device   | Traccar ID {} | Name: {} | ID: {}",
+            traccar_id,
+            display_name,
+            airtag.identifier or "(none)",
         )
 
     # Build device name and identifier mappings
