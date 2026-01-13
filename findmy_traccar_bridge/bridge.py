@@ -581,7 +581,19 @@ def init() -> None:
 
         method.submit(code)
 
+    # Test the account by making a simple API call
+    print("Verifying account can access FindMy service...")
+    try:
+        # Fetch with empty device list to verify API access works
+        acc.fetch_last_reports([])
+        print("Account verified successfully!")
+    except Exception as e:
+        print(f"WARNING: Account login succeeded but verification failed: {e}")
+        print("The account may still work - saving anyway.")
+
     # Use new persistence API
     acc.to_json(acc_store)
     print(f"Account {account_id} initialized successfully!")
     print(f"Saved to: {acc_store}")
+    print()
+    print("NOTE: Restart the bridge for this account to take effect.")
