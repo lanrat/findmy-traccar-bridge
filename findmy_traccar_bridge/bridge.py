@@ -1,6 +1,7 @@
 import datetime
 import getpass
 import json
+import logging
 import os
 import sys
 import time
@@ -19,8 +20,32 @@ from findmy.reports import (
 )
 from loguru import logger
 
+
+# Intercept standard library logging and redirect to loguru
+class InterceptHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        # Get corresponding Loguru level if it exists
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+
+        # Find caller from where originated the logged message
+        frame, depth = logging.currentframe(), 2
+        while frame and frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+
+        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+
+# Configure loguru
 logger.remove()
 logger.add(sys.stderr, level=os.environ.get("BRIDGE_LOGGING_LEVEL", "INFO"))
+
+# Redirect findmy library logs to loguru
+logging.getLogger("findmy").setLevel(os.environ.get("BRIDGE_LOGGING_LEVEL", "INFO"))
+logging.getLogger("findmy").addHandler(InterceptHandler())
 
 POLLING_INTERVAL = int(os.environ.get("BRIDGE_POLL_INTERVAL", 60 * 60))
 
