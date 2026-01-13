@@ -404,10 +404,13 @@ def bridge() -> None:
             account_ids = discover_accounts()
 
     accounts: dict[int, AppleAccount] = {}
+    account_names: dict[int, str] = {}  # account_id -> display name for logging
     for account_id in account_ids:
         try:
-            accounts[account_id] = load_account(account_id)
-            logger.info("Loaded Apple account {}", account_id)
+            acc = load_account(account_id)
+            accounts[account_id] = acc
+            account_names[account_id] = acc.account_name or f"account_{account_id}"
+            logger.info("Loaded Apple account {}: {}", account_id, account_names[account_id])
         except Exception as e:
             logger.error("Failed to load account {}: {}", account_id, e)
 
@@ -492,8 +495,9 @@ def bridge() -> None:
     if next_poll:
         account_id, wait_time = next_poll
         logger.info(
-            "Next Apple API polling (account {}) in {:.0f} seconds ({} UTC)",
+            "Next Apple API polling (account {} - {}) in {:.0f} seconds ({} UTC)",
             account_id,
+            account_names.get(account_id, "unknown"),
             wait_time,
             (datetime.datetime.now() + datetime.timedelta(seconds=wait_time)).isoformat(timespec="seconds"),
         )
@@ -517,7 +521,7 @@ def bridge() -> None:
             acc = accounts[account_to_poll]
             acc_store = get_account_store(account_to_poll)
 
-            logger.debug("Polling Apple API with account {}...", account_to_poll)
+            logger.info("Polling Apple API with account {} ({})...", account_to_poll, account_names.get(account_to_poll, "unknown"))
 
             already_uploaded = {
                 (location["id"], location["timestamp"])
@@ -533,7 +537,7 @@ def bridge() -> None:
             try:
                 reports_dict = acc.fetch_location_history(all_devices) if all_devices else {}
             except Exception as e:
-                logger.error("Failed to fetch locations with account {}: {}", account_to_poll, e)
+                logger.error("Failed to fetch locations with account {} ({}): {}", account_to_poll, account_names.get(account_to_poll, "unknown"), e)
                 # Still update last poll time to avoid hammering on errors
                 persistent_data["account_last_poll"][str(account_to_poll)] = int(
                     datetime.datetime.now().timestamp()
@@ -611,8 +615,9 @@ def bridge() -> None:
             if next_poll:
                 next_account, next_wait = next_poll
                 logger.info(
-                    "Next Apple API polling (account {}) in {:.0f} seconds ({} UTC)",
+                    "Next Apple API polling (account {} - {}) in {:.0f} seconds ({} UTC)",
                     next_account,
+                    account_names.get(next_account, "unknown"),
                     next_wait,
                     (datetime.datetime.now() + datetime.timedelta(seconds=next_wait)).isoformat(timespec="seconds"),
                 )
