@@ -496,49 +496,56 @@ def bridge() -> None:
     persistent_data: PersistentData = json.loads(persistent_data_store.read_text())
     last_traccar_push_timestamp = 0.0
 
-    # Calculate next poll time
-    def get_next_account_to_poll() -> tuple[int, float] | None:
-        """Find the account that should be polled next and how long to wait."""
+    # Round-robin account polling
+    account_order = sorted(accounts.keys())  # deterministic order
+
+    # On startup, find which account to start with (the one polled longest ago)
+    def find_oldest_account_index() -> int:
+        oldest_idx = 0
+        oldest_time = persistent_data["account_last_poll"].get(str(account_order[0]), 0)
+        for i, aid in enumerate(account_order):
+            last_poll = persistent_data["account_last_poll"].get(str(aid), 0)
+            if last_poll < oldest_time:
+                oldest_time = last_poll
+                oldest_idx = i
+        return oldest_idx
+
+    current_account_index = find_oldest_account_index()
+
+    def get_next_account_to_poll() -> tuple[int, float]:
+        """Get the next account in round-robin order and how long to wait."""
         now = datetime.datetime.now().timestamp()
-        best_account = None
-        best_wait_time = float('inf')
 
-        for account_id in accounts:
-            last_poll = persistent_data["account_last_poll"].get(str(account_id), 0)
-            time_since_poll = now - last_poll
-            wait_time = POLLING_INTERVAL - time_since_poll
+        # Find when any account was last polled (for spacing)
+        all_last_polls = [
+            persistent_data["account_last_poll"].get(str(aid), 0)
+            for aid in accounts
+        ]
+        last_any_poll = max(all_last_polls) if all_last_polls else 0
+        wait_time = max(0, effective_interval - (now - last_any_poll))
 
-            if wait_time < best_wait_time:
-                best_wait_time = wait_time
-                best_account = account_id
+        return (account_order[current_account_index], wait_time)
 
-        if best_account is not None:
-            return (best_account, max(0, best_wait_time))
-        return None
+    def advance_to_next_account() -> None:
+        """Move to the next account in round-robin order."""
+        nonlocal current_account_index
+        current_account_index = (current_account_index + 1) % len(account_order)
 
     # Log initial status
-    next_poll = get_next_account_to_poll()
-    if next_poll:
-        account_id, wait_time = next_poll
-        logger.info(
-            "Next Apple API polling (account {} - {}) in {:.0f} seconds ({} UTC)",
-            account_id,
-            account_names.get(account_id, "unknown"),
-            wait_time,
-            (datetime.datetime.now() + datetime.timedelta(seconds=wait_time)).isoformat(timespec="seconds"),
-        )
+    account_id, wait_time = get_next_account_to_poll()
+    logger.info(
+        "Next Apple API polling (account {} - {}) in {:.0f} seconds ({} UTC)",
+        account_id,
+        account_names.get(account_id, "unknown"),
+        wait_time,
+        (datetime.datetime.now() + datetime.timedelta(seconds=wait_time)).isoformat(timespec="seconds"),
+    )
 
     while True:
-        next_poll = get_next_account_to_poll()
+        account_to_poll, time_until_next_apple_polling = get_next_account_to_poll()
         time_until_next_traccar_push = -(
             datetime.datetime.now().timestamp() - last_traccar_push_timestamp - 30
         )
-
-        if next_poll is None:
-            time.sleep(1)
-            continue
-
-        account_to_poll, time_until_next_apple_polling = next_poll
 
         if time_until_next_apple_polling > 0 and time_until_next_traccar_push > 0:
             # sleep short durations so that SIGTERM stops the container
@@ -569,6 +576,7 @@ def bridge() -> None:
                     datetime.datetime.now().timestamp()
                 )
                 commit(persistent_data)
+                advance_to_next_account()
                 continue
 
             persistent_data["account_last_poll"][str(account_to_poll)] = int(
@@ -636,17 +644,18 @@ def bridge() -> None:
             # Save account state (may include refreshed tokens)
             acc.to_json(acc_store)
 
+            # Advance to next account in round-robin
+            advance_to_next_account()
+
             # Log next poll info
-            next_poll = get_next_account_to_poll()
-            if next_poll:
-                next_account, next_wait = next_poll
-                logger.info(
-                    "Next Apple API polling (account {} - {}) in {:.0f} seconds ({} UTC)",
-                    next_account,
-                    account_names.get(next_account, "unknown"),
-                    next_wait,
-                    (datetime.datetime.now() + datetime.timedelta(seconds=next_wait)).isoformat(timespec="seconds"),
-                )
+            next_account, next_wait = get_next_account_to_poll()
+            logger.info(
+                "Next Apple API polling (account {} - {}) in {:.0f} seconds ({} UTC)",
+                next_account,
+                account_names.get(next_account, "unknown"),
+                next_wait,
+                (datetime.datetime.now() + datetime.timedelta(seconds=next_wait)).isoformat(timespec="seconds"),
+            )
 
             commit(persistent_data)
 
