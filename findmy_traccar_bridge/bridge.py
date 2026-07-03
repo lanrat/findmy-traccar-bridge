@@ -214,6 +214,7 @@ def bridge() -> None:
     # Build device name and identifier mappings
     device_names: dict[int, str] = {}
     device_identifiers: dict[int, str] = {}  # Full identifier for Traccar attributes
+    device_serials: dict[int, str] = {}  # Serial numbers for Traccar attributes
     for key in haystack_keys:
         tid = int.from_bytes(key.hashed_adv_key_bytes) % 1_000_000
         device_names[tid] = f"Haystack {key.hashed_adv_key_b64[:8]}"
@@ -224,6 +225,8 @@ def bridge() -> None:
         device_names[tid] = airtag.name or airtag.identifier or f"AirTag {tid}"
         if airtag.identifier:
             device_identifiers[tid] = airtag.identifier
+        if airtag.serial_number:
+            device_serials[tid] = airtag.serial_number
 
     # Proactively create all devices in Traccar at startup
     if AUTO_CREATE_DEVICES:
@@ -438,6 +441,8 @@ def bridge() -> None:
                 device_id = location["id"]
                 if device_id in device_identifiers:
                     upload_data["findmy_id"] = device_identifiers[device_id]
+                if device_id in device_serials:
+                    upload_data["serial"] = device_serials[device_id]
 
                 resp = requests.post(
                     TRACCAR_SERVER,

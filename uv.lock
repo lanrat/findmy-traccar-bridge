@@ -119,7 +119,7 @@ wheels = [
 
 [[package]]
 name = "bleak"
-version = "2.1.1"
+version = "3.0.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dbus-fast", marker = "sys_platform == 'linux'" },
@@ -136,9 +136,9 @@ dependencies = [
     { name = "winrt-windows-foundation-collections", marker = "sys_platform == 'win32'" },
     { name = "winrt-windows-storage-streams", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/45/8a/5acbd4da6a5a301fab56ff6d6e9e6b6945e6e4a2d1d213898c21b1d3a19b/bleak-2.1.1.tar.gz", hash = "sha256:4600cc5852f2392ce886547e127623f188e689489c5946d422172adf80635cf9", size = 120634, upload-time = "2025-12-31T20:43:28.697Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/16/df/05a3f80ca8e3f7f5b0dba68a9e618147c909ccdba1468f07487dc8d72a9d/bleak-3.0.2.tar.gz", hash = "sha256:c2229cb8238d5876b4bd05c74bf7a1aea1f88da39d2e51ac9dfd5cc319d5265f", size = 125293, upload-time = "2026-05-02T23:01:04.066Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/99/fe/22aec895f040c1e457d6e6fcc79286fbb17d54602600ab2a58837bec7be1/bleak-2.1.1-py3-none-any.whl", hash = "sha256:61ac1925073b580c896a92a8c404088c5e5ec9dc3c5bd6fc17554a15779d83de", size = 141258, upload-time = "2025-12-31T20:43:27.302Z" },
+    { url = "https://files.pythonhosted.org/packages/26/54/05aceb9cd80073805b3ed8522e3196e8cb22f70e741873fa51406c31f4e7/bleak-3.0.2-py3-none-any.whl", hash = "sha256:39092feb9e83f1df5ad2f88e837723c7211c982ce9e9cda6235104bc2ebe0d0d", size = 146490, upload-time = "2026-05-02T23:01:02.592Z" },
 ]
 
 [[package]]
@@ -276,7 +276,7 @@ wheels = [
 
 [[package]]
 name = "findmy"
-version = "0.9.8"
+version = "0.10.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -287,9 +287,9 @@ dependencies = [
     { name = "srp" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3a/6b/30ccc6cceb1dd3fb69676fddf77f5cc425142f7868d4281dfa56ce5b64c9/findmy-0.9.8.tar.gz", hash = "sha256:1592e04ec975aa0b0ae46f12656a24a8c94b5f6e04e0520e2c828ec7b40c0ff8", size = 1120997, upload-time = "2026-01-08T21:47:46.348Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/78/a0/20b93a397977bb939d0be625a29ad61afcb509db27257ac949fce67e045c/findmy-0.10.1.tar.gz", hash = "sha256:fdc9ea6122ebdc75a8c4e9e23f637881211632a0bbbfa0b8af99dc6d1da336be", size = 1123554, upload-time = "2026-06-01T20:45:25.318Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8c/b6/3220459ec780a7eeb8d73d3b049a5393537ed81f89be8ff12dabc5645470/findmy-0.9.8-py3-none-any.whl", hash = "sha256:6fab5541b0823a2652e8c4d5fca5109b13dff7ffe913a365256e62cf81ff3714", size = 49208, upload-time = "2026-01-08T21:47:44.785Z" },
+    { url = "https://files.pythonhosted.org/packages/94/55/1e84cce74b4af0092d36f1f4663537d48062c4e8119adecc8cbf3c50f9e5/findmy-0.10.1-py3-none-any.whl", hash = "sha256:422321e77f2031aa11978a1949a19d2939c8c845ee52fd43c65a01e7e07d481c", size = 50588, upload-time = "2026-06-01T20:45:24.282Z" },
 ]
 
 [[package]]
@@ -309,7 +309,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "findmy", specifier = ">=0.9.8" },
+    { name = "findmy", specifier = ">=0.10.1" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "requests", specifier = ">=2.32.3" },
 ]
